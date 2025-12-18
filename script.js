@@ -170,46 +170,8 @@ function computeShadow(footprint) {
     y: pt.y + shadowVector.y,
   }));
 
-  const shadowPolygon = convexHull([...footprint, ...offsetCorners]);
+  const shadowPolygon = [...footprint, ...offsetCorners.slice().reverse()];
   return { shadowPolygon, shadowLength, shadowVector };
-}
-
-function convexHull(points) {
-  if (points.length <= 3) return points;
-  const sorted = points
-    .slice()
-    .sort((a, b) => (a.x === b.x ? a.y - b.y : a.x - b.x));
-
-  const buildHalf = (pts) => {
-    const half = [];
-    pts.forEach((pt) => {
-      while (
-        half.length >= 2 &&
-        cross(
-          subtract(half[half.length - 1], half[half.length - 2]),
-          subtract(pt, half[half.length - 1])
-        ) <= 0
-      ) {
-        half.pop();
-      }
-      half.push(pt);
-    });
-    return half;
-  };
-
-  const lower = buildHalf(sorted);
-  const upper = buildHalf(sorted.slice().reverse());
-  upper.pop();
-  lower.pop();
-  return [...lower, ...upper];
-}
-
-function subtract(a, b) {
-  return { x: a.x - b.x, y: a.y - b.y };
-}
-
-function cross(a, b) {
-  return a.x * b.y - a.y * b.x;
 }
 
 function resizeCanvas() {
