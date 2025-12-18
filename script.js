@@ -1,5 +1,9 @@
 const canvas = document.getElementById("siteCanvas");
-const ctx = canvas.getContext("2d");
+const gl = canvas.getContext("webgl", { antialias: true });
+
+if (!gl) {
+  throw new Error("WebGL not supported in this browser.");
+}
 
 const defaults = {
   width: 24,
@@ -15,7 +19,6 @@ const defaults = {
 };
 
 const state = { ...defaults };
-let currentScale = 1;
 
 const statEls = {
   shadowLength: document.getElementById("shadowLength"),
@@ -23,9 +26,188 @@ const statEls = {
   sunVector: document.getElementById("sunVector"),
 };
 
-function toRadians(deg) {
-  return (deg * Math.PI) / 180;
+const vertexSource = `
+  attribute vec2 aPosition;
+  varying vec2 vUV;
+
+  void main() {
+    vUV = aPosition * 0.5 + 0.5;
+    gl_Position = vec4(aPosition, 0.0, 1.0);
+  }
+`;
+
+const fragmentSource = `
+  precision mediump float;
+
+  varying vec2 vUV;
+
+  uniform float uHalfWidth;
+  uniform float uHalfDepth;
+  uniform float uHeight;
+  uniform float uRotation;
+  uniform float uSunAltitude;
+  uniform float uSunAzimuth;
+  uniform float uGridSpacing;
+  uniform float uGroundSize;
+  uniform float uOffsetX;
+  uniform float uOffsetY;
+  uniform float uAspect;
+  uniform float uShadowLength;
+
+  const float PI = 3.14159265359;
+
+  vec2 rotate(vec2 p, float angle) {
+    float c = cos(angle);
+    float s = sin(angle);
+    return vec2(c * p.x - s * p.y, s * p.x + c * p.y);
+  }
+
+  float boxSDF(vec2 p, vec2 b) {
+    vec2 d = abs(p) - b;
+    return length(max(d, 0.0)) + min(max(d.x, d.y), 0.0);
+  }
+
+  bool rayHitsBox(vec2 worldPos, vec2 offset, float rot, vec2 halfSize, vec2 dir, float maxLen) {
+    vec2 p = rotate(worldPos - offset, -rot);
+    vec2 d = rotate(dir, -rot);
+
+    float tMin = 0.0;
+    float tMax = maxLen;
+    const float EPS = 1e-5;
+
+    if (abs(d.x) < EPS) {
+      if (p.x < -halfSize.x || p.x > halfSize.x) return false;
+    } else {
+      float t1 = (-halfSize.x - p.x) / d.x;
+      float t2 = (halfSize.x - p.x) / d.x;
+      if (t1 > t2) { float temp = t1; t1 = t2; t2 = temp; }
+      tMin = max(tMin, t1);
+      tMax = min(tMax, t2);
+    }
+
+    if (abs(d.y) < EPS) {
+      if (p.y < -halfSize.y || p.y > halfSize.y) return false;
+    } else {
+      float t1 = (-halfSize.y - p.y) / d.y;
+      float t2 = (halfSize.y - p.y) / d.y;
+      if (t1 > t2) { float temp = t1; t1 = t2; t2 = temp; }
+      tMin = max(tMin, t1);
+      tMax = min(tMax, t2);
+    }
+
+    return tMax >= tMin && tMax >= 0.0 && tMin <= maxLen;
+  }
+
+  float gridLines(vec2 world, float spacing) {
+    float wrapX = abs(mod(world.x + 0.5 * spacing, spacing) - 0.5 * spacing);
+    float wrapY = abs(mod(world.y + 0.5 * spacing, spacing) - 0.5 * spacing);
+    float lineDist = min(wrapX, wrapY);
+    return 1.0 - smoothstep(0.08, 0.25, lineDist);
+  }
+
+  void main() {
+    vec2 ndc = vUV * 2.0 - 1.0;
+    float scale = uGroundSize * 0.5;
+    vec2 world = (uAspect > 1.0)
+      ? vec2(ndc.x * scale * uAspect, ndc.y * scale)
+      : vec2(ndc.x * scale, ndc.y * scale / uAspect);
+
+    vec2 offset = vec2(uOffsetX, uOffsetY);
+    float rot = radians(uRotation);
+    float alt = radians(uSunAltitude);
+    float az = radians(uSunAzimuth);
+    vec2 sunDir = normalize(vec2(-sin(az), -cos(az)));
+    vec2 halfSize = vec2(uHalfWidth, uHalfDepth);
+
+    vec2 local = rotate(world - offset, -rot);
+    float insideFootprint = step(abs(local.x), uHalfWidth) * step(abs(local.y), uHalfDepth);
+
+    float shadowMask = rayHitsBox(world, offset, rot, halfSize, sunDir, uShadowLength) ? 1.0 : 0.0;
+
+    float grid = gridLines(world, uGridSpacing);
+
+    float distToGround = max(abs(world.x), abs(world.y)) - (uGroundSize * 0.5);
+    float groundMask = 1.0 - smoothstep(-0.5, 0.5, distToGround);
+
+    vec3 base = mix(vec3(0.06, 0.08, 0.13), vec3(0.11, 0.14, 0.22), groundMask);
+    base += grid * 0.12 * groundMask;
+
+    vec3 shadowColor = vec3(0.24, 0.44, 0.86);
+    vec3 buildingColor = vec3(0.44, 0.87, 0.66);
+
+    vec3 color = base;
+    color = mix(color, shadowColor, shadowMask * 0.45);
+    color = mix(color, buildingColor, insideFootprint * 0.9);
+
+    float edge = smoothstep(0.0, 0.6, abs(boxSDF(local, halfSize)));
+    color = mix(color, buildingColor * 0.7 + vec3(0.05, 0.09, 0.12), edge * insideFootprint * 0.2);
+
+    float vignette = smoothstep(1.6, 0.2, length(ndc));
+    color *= vignette + 0.35;
+
+    gl_FragColor = vec4(color, 1.0);
+  }
+`;
+
+function createShader(type, source) {
+  const shader = gl.createShader(type);
+  gl.shaderSource(shader, source);
+  gl.compileShader(shader);
+  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+    throw new Error(gl.getShaderInfoLog(shader) || "Shader compilation failed.");
+  }
+  return shader;
 }
+
+function createProgram() {
+  const program = gl.createProgram();
+  const vs = createShader(gl.VERTEX_SHADER, vertexSource);
+  const fs = createShader(gl.FRAGMENT_SHADER, fragmentSource);
+  gl.attachShader(program, vs);
+  gl.attachShader(program, fs);
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "Program link failed.");
+  }
+  return program;
+}
+
+const program = createProgram();
+gl.useProgram(program);
+
+const quadBuffer = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, quadBuffer);
+gl.bufferData(
+  gl.ARRAY_BUFFER,
+  new Float32Array([
+    -1, -1,
+    1, -1,
+    -1, 1,
+    -1, 1,
+    1, -1,
+    1, 1,
+  ]),
+  gl.STATIC_DRAW
+);
+
+const positionLocation = gl.getAttribLocation(program, "aPosition");
+gl.enableVertexAttribArray(positionLocation);
+gl.vertexAttribPointer(positionLocation, 2, gl.FLOAT, false, 0, 0);
+
+const uniforms = {
+  uHalfWidth: gl.getUniformLocation(program, "uHalfWidth"),
+  uHalfDepth: gl.getUniformLocation(program, "uHalfDepth"),
+  uHeight: gl.getUniformLocation(program, "uHeight"),
+  uRotation: gl.getUniformLocation(program, "uRotation"),
+  uSunAltitude: gl.getUniformLocation(program, "uSunAltitude"),
+  uSunAzimuth: gl.getUniformLocation(program, "uSunAzimuth"),
+  uGridSpacing: gl.getUniformLocation(program, "uGridSpacing"),
+  uGroundSize: gl.getUniformLocation(program, "uGroundSize"),
+  uOffsetX: gl.getUniformLocation(program, "uOffsetX"),
+  uOffsetY: gl.getUniformLocation(program, "uOffsetY"),
+  uAspect: gl.getUniformLocation(program, "uAspect"),
+  uShadowLength: gl.getUniformLocation(program, "uShadowLength"),
+};
 
 function clamp(value, min, max) {
   return Math.min(Math.max(value, min), max);
@@ -36,207 +218,57 @@ function applyStep(value, min, step) {
   return Number(snapped.toFixed(4));
 }
 
-function worldToCanvas(point) {
-  return {
-    x: canvas.width / 2 + point.x * currentScale,
-    y: canvas.height / 2 - point.y * currentScale,
-  };
+function toRadians(deg) {
+  return (deg * Math.PI) / 180;
 }
 
-function drawPolygon(points, options = {}) {
-  if (!points.length) return;
-  ctx.beginPath();
-  points.forEach((pt, idx) => {
-    const canvasPt = worldToCanvas(pt);
-    if (idx === 0) ctx.moveTo(canvasPt.x, canvasPt.y);
-    else ctx.lineTo(canvasPt.x, canvasPt.y);
-  });
-  ctx.closePath();
-
-  if (options.fill) {
-    ctx.fillStyle = options.fill;
-    ctx.fill();
-  }
-  if (options.stroke) {
-    ctx.lineWidth = options.lineWidth || 1;
-    ctx.setLineDash(options.dash || []);
-    ctx.strokeStyle = options.stroke;
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-}
-
-function drawGrid(halfSize) {
-  ctx.lineWidth = 1;
-  ctx.strokeStyle = "rgba(255,255,255,0.06)";
-  ctx.beginPath();
-  for (let g = -halfSize; g <= halfSize; g += state.gridSpacing) {
-    const top = worldToCanvas({ x: g, y: halfSize });
-    const bottom = worldToCanvas({ x: g, y: -halfSize });
-    ctx.moveTo(top.x, top.y);
-    ctx.lineTo(bottom.x, bottom.y);
-
-    const left = worldToCanvas({ x: -halfSize, y: g });
-    const right = worldToCanvas({ x: halfSize, y: g });
-    ctx.moveTo(left.x, left.y);
-    ctx.lineTo(right.x, right.y);
-  }
-  ctx.stroke();
-}
-
-function drawAxes(halfSize) {
-  const axisLength = Math.min(halfSize, 12);
-  const northStart = worldToCanvas({ x: 0, y: 0 });
-  const northEnd = worldToCanvas({ x: 0, y: axisLength });
-  ctx.strokeStyle = "rgba(255,255,255,0.25)";
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.moveTo(northStart.x, northStart.y);
-  ctx.lineTo(northEnd.x, northEnd.y);
-  ctx.stroke();
-  ctx.fillStyle = "rgba(255,255,255,0.75)";
-  ctx.font = "12px Inter, sans-serif";
-  ctx.fillText("N", northEnd.x + 6, northEnd.y + 4);
-}
-
-function drawSunArrow(center, shadowVector) {
-  const sunDir = { x: -shadowVector.x, y: -shadowVector.y };
-  const length = Math.min(20, Math.hypot(sunDir.x, sunDir.y));
-  const scale = length === 0 ? 0 : 18 / length;
-  const end = {
-    x: center.x + sunDir.x * scale,
-    y: center.y + sunDir.y * scale,
-  };
-  const start = { x: center.x, y: center.y };
-  const startPt = worldToCanvas(start);
-  const endPt = worldToCanvas(end);
-
-  ctx.strokeStyle = "rgba(255, 200, 134, 0.9)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.moveTo(startPt.x, startPt.y);
-  ctx.lineTo(endPt.x, endPt.y);
-  ctx.stroke();
-
-  const angle = Math.atan2(startPt.y - endPt.y, startPt.x - endPt.x);
-  const headLength = 8;
-  ctx.beginPath();
-  ctx.moveTo(endPt.x, endPt.y);
-  ctx.lineTo(
-    endPt.x + headLength * Math.cos(angle + Math.PI / 7),
-    endPt.y + headLength * Math.sin(angle + Math.PI / 7)
-  );
-  ctx.lineTo(
-    endPt.x + headLength * Math.cos(angle - Math.PI / 7),
-    endPt.y + headLength * Math.sin(angle - Math.PI / 7)
-  );
-  ctx.lineTo(endPt.x, endPt.y);
-  ctx.fillStyle = "rgba(255, 200, 134, 0.9)";
-  ctx.fill();
-}
-
-function getFootprint() {
-  const halfWidth = state.width / 2;
-  const halfDepth = state.depth / 2;
-  const rad = toRadians(state.rotation);
-  const cos = Math.cos(rad);
-  const sin = Math.sin(rad);
-  const baseRect = [
-    { x: -halfWidth, y: -halfDepth },
-    { x: halfWidth, y: -halfDepth },
-    { x: halfWidth, y: halfDepth },
-    { x: -halfWidth, y: halfDepth },
-  ];
-
-  return baseRect.map((pt) => ({
-    x: state.offsetX + pt.x * cos - pt.y * sin,
-    y: state.offsetY + pt.x * sin + pt.y * cos,
-  }));
-}
-
-function computeShadow(footprint) {
+function computeShadowLength() {
   const altitudeRad = toRadians(clamp(state.sunAltitude, 1, 89.9));
-  const azimuthRad = toRadians(state.sunAzimuth);
-  let shadowLength = state.height / Math.tan(altitudeRad);
-  const maxLength = state.groundSize * 1.5;
-  shadowLength = Math.min(shadowLength, maxLength);
-  const direction = { x: -Math.sin(azimuthRad), y: -Math.cos(azimuthRad) };
-  const shadowVector = {
-    x: direction.x * shadowLength,
-    y: direction.y * shadowLength,
-  };
-  const offsetCorners = footprint.map((pt) => ({
-    x: pt.x + shadowVector.x,
-    y: pt.y + shadowVector.y,
-  }));
-
-  const shadowPolygon = [...footprint, ...offsetCorners.slice().reverse()];
-  return { shadowPolygon, shadowLength, shadowVector };
+  const rawLength = state.height / Math.tan(altitudeRad);
+  const maxLength = state.groundSize * 1.6;
+  return Math.min(rawLength, maxLength);
 }
 
 function resizeCanvas() {
   const rect = canvas.parentElement.getBoundingClientRect();
   const width = Math.max(680, rect.width);
-  canvas.width = width;
-  canvas.height = Math.round(width * 0.7);
+  const height = Math.round(width * 0.7);
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  canvas.style.width = `${width}px`;
+  canvas.style.height = `${height}px`;
+  gl.viewport(0, 0, canvas.width, canvas.height);
+}
+
+function updateUniforms() {
+  const aspect = canvas.width / canvas.height;
+  const shadowLength = computeShadowLength();
+
+  gl.uniform1f(uniforms.uHalfWidth, state.width / 2);
+  gl.uniform1f(uniforms.uHalfDepth, state.depth / 2);
+  gl.uniform1f(uniforms.uHeight, state.height);
+  gl.uniform1f(uniforms.uRotation, state.rotation);
+  gl.uniform1f(uniforms.uSunAltitude, state.sunAltitude);
+  gl.uniform1f(uniforms.uSunAzimuth, state.sunAzimuth);
+  gl.uniform1f(uniforms.uGridSpacing, state.gridSpacing);
+  gl.uniform1f(uniforms.uGroundSize, state.groundSize);
+  gl.uniform1f(uniforms.uOffsetX, state.offsetX);
+  gl.uniform1f(uniforms.uOffsetY, state.offsetY);
+  gl.uniform1f(uniforms.uAspect, aspect);
+  gl.uniform1f(uniforms.uShadowLength, shadowLength);
+
+  return shadowLength;
 }
 
 function render() {
   resizeCanvas();
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const shadowLength = updateUniforms();
 
-  const halfSize = state.groundSize / 2;
-  currentScale = Math.min(canvas.width, canvas.height) / (state.groundSize * 1.1);
+  gl.clearColor(0, 0, 0, 1);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.drawArrays(gl.TRIANGLES, 0, 6);
 
-  const footprint = getFootprint();
-  const { shadowPolygon, shadowLength, shadowVector } = computeShadow(footprint);
-
-  drawPolygon(
-    [
-      { x: -halfSize, y: -halfSize },
-      { x: halfSize, y: -halfSize },
-      { x: halfSize, y: halfSize },
-      { x: -halfSize, y: halfSize },
-    ],
-    {
-      fill: "rgba(255,255,255,0.02)",
-      stroke: "rgba(255,255,255,0.06)",
-      lineWidth: 1.2,
-    }
-  );
-
-  drawGrid(halfSize);
-  drawAxes(halfSize);
-
-  const buildingCenter = { x: state.offsetX, y: state.offsetY };
-  const gradient = ctx.createLinearGradient(
-    worldToCanvas(buildingCenter).x,
-    worldToCanvas(buildingCenter).y,
-    worldToCanvas({
-      x: buildingCenter.x + shadowVector.x,
-      y: buildingCenter.y + shadowVector.y,
-    }).x,
-    worldToCanvas({
-      x: buildingCenter.x + shadowVector.x,
-      y: buildingCenter.y + shadowVector.y,
-    }).y
-  );
-  gradient.addColorStop(0, "rgba(79, 139, 255, 0.35)");
-  gradient.addColorStop(1, "rgba(79, 139, 255, 0.05)");
-
-  drawPolygon(shadowPolygon, {
-    fill: gradient,
-    stroke: "rgba(79, 139, 255, 0.35)",
-    lineWidth: 1.5,
-  });
-
-  drawPolygon(footprint, {
-    fill: "rgba(167, 243, 208, 0.22)",
-    stroke: "rgba(167, 243, 208, 0.9)",
-    lineWidth: 2,
-  });
-
-  drawSunArrow(buildingCenter, shadowVector);
   updateStats(shadowLength);
 }
 
